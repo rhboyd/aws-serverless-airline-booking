@@ -1,0 +1,9 @@
+{
+  "app": "npx ts-node bin/cdk.ts",
+  "context": {
+    "bookingTable": "Booking-oeolg264ajgvzatzttnqvml6ma-dev",
+    "flightTable": "Flight-oeolg264ajgvzatzttnqvml6ma-dev",
+    "stage": "dev",
+    "appSyncApiId": "oeolg264ajgvzatzttnqvml6ma"
+  }
+}
