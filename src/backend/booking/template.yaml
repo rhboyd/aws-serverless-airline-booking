@@ -6,7 +6,11 @@ Description: >
 Globals:
   Function:
     Timeout: 5
-
+    Tracing: Active
+    Environment:
+        Variables:
+            POWERTOOLS_SERVICE_NAME: booking
+            LOG_LEVEL: INFO
 
 Parameters:
     BookingTable:
@@ -37,12 +41,14 @@ Resources:
   ConfirmBooking:
     Type: AWS::Serverless::Function
     Properties:
+      FunctionName: !Sub Airline-ConfirmBooking-${Stage}
       Handler: confirm.lambda_handler
       CodeUri: src/confirm-booking
       Runtime: python3.7
       Environment:
         Variables:
           BOOKING_TABLE_NAME: !Ref BookingTable
+          STAGE: !Ref Stage
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref BookingTable
@@ -50,12 +56,14 @@ Resources:
   CancelBooking:
     Type: AWS::Serverless::Function
     Properties:
+      FunctionName: !Sub Airline-CancelBooking-${Stage}
       Handler: cancel.lambda_handler
       CodeUri: src/cancel-booking
       Runtime: python3.7
       Environment:
         Variables:
           BOOKING_TABLE_NAME: !Ref BookingTable
+          STAGE: !Ref Stage
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref BookingTable
@@ -63,12 +71,14 @@ Resources:
   ReserveBooking:
     Type: AWS::Serverless::Function
     Properties:
+      FunctionName: !Sub Airline-ReserveBooking-${Stage}
       Handler: reserve.lambda_handler
       CodeUri: src/reserve-booking
       Runtime: python3.7
       Environment:
         Variables:
           BOOKING_TABLE_NAME: !Ref BookingTable
+          STAGE: !Ref Stage
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref BookingTable
@@ -79,12 +89,14 @@ Resources:
   NotifyBooking:
     Type: AWS::Serverless::Function
     Properties:
+      FunctionName: !Sub Airline-NotifyBooking-${Stage}
       Handler: notify.lambda_handler
       CodeUri: src/notify-booking
       Runtime: python3.7
       Environment:
         Variables:
           BOOKING_TOPIC: !Ref BookingTopic
+          STAGE: !Ref Stage
       Policies:
         - SNSPublishMessagePolicy:
             TopicName: !Sub ${BookingTopic.TopicName}
@@ -123,12 +135,26 @@ Resources:
                 Action:
                   - dynamodb:*
                 Resource:
-                    - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${BookingTable}
                     - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FlightTable}
+        - PolicyName: Send2DLQ
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                    - !Sub ${BookingsDLQ.Arn}
+
+  BookingsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
 
   ProcessBooking:
     Type: AWS::StepFunctions::StateMachine
     Properties:
+      StateMachineName: !Sub Airline-ProcessBooking-${Stage}
       DefinitionString: !Sub |
         {
             "StartAt": "Reserve Flight",
@@ -253,19 +279,13 @@ Resources:
                             "Next": "Notify Booking Failed"
                         }
                     ],
+                    "ResultPath": null,
                     "Next": "Notify Booking Failed"
                 },
                 "Collect Payment": {
                     "Type": "Task",
                     "Resource": "${CollectPaymentFunction}",
                     "Catch": [
-                        {
-                            "ErrorEquals": [
-                                "PaymentException"
-                            ],
-                            "ResultPath": "$.paymentError",
-                            "Next": "Cancel Booking"
-                        },
                         {
                             "ErrorEquals": [
                                 "States.ALL"
@@ -288,6 +308,15 @@ Resources:
                             "IntervalSeconds": 1,
                             "BackoffRate": 2,
                             "MaxAttempts": 2
+                        }
+                    ],
+                    "Catch": [
+                        {
+                            "ErrorEquals": [
+                                "States.ALL"
+                            ],
+                            "ResultPath": "$.bookingError",
+                            "Next": "Release Flight Seat"
                         }
                     ],
                     "ResultPath": null,
@@ -321,6 +350,15 @@ Resources:
                 "Refund Payment": {
                     "Type": "Task",
                     "Resource": "${RefundPaymentFunction}",
+                    "Catch": [
+                        {
+                            "ErrorEquals": [
+                                "States.ALL"
+                            ],
+                            "ResultPath": "$.paymentError",
+                            "Next": "Cancel Booking"
+                        }
+                    ],
                     "ResultPath": null,
                     "Next": "Cancel Booking"
                 },
@@ -337,11 +375,17 @@ Resources:
                             "MaxAttempts": 2
                         }
                     ],
+                    "Catch": [
+                        {
+                            "ErrorEquals": [
+                                "States.ALL"
+                            ],
+                            "ResultPath": "$.notificationgError",
+                            "Next": "Booking DLQ"
+                        }
+                    ],
                     "ResultPath": "$.notificationId",
-                    "Next": "Booking Failed"
-                },
-                "Booking Failed": {
-                    "Type": "Fail"
+                    "Next": "Booking DLQ"
                 },
                 "Notify Booking Confirmed": {
                     "Type": "Task",
@@ -358,6 +402,19 @@ Resources:
                     ],
                     "ResultPath": "$.notificationId",
                     "Next": "Booking Confirmed"
+                },
+                "Booking DLQ": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sqs:sendMessage",
+                    "Parameters": {
+                        "QueueUrl": "${BookingsDLQ}",
+                        "MessageBody.$": "$"
+                    },
+                    "ResultPath": "$.deadLetterQueue",
+                    "Next": "Booking Failed"
+                },
+                "Booking Failed": {
+                    "Type": "Fail"
                 },
                 "Booking Confirmed": {
                     "Type": "Pass",
@@ -453,12 +510,13 @@ Resources:
             "resourcePath": "/",
             "params": {
                 "headers": {
-                "content-type": "application/x-amz-json-1.0",
-                "x-amz-target":"AWSStepFunctions.StartExecution"
+                    "content-type": "application/x-amz-json-1.0",
+                    "x-amz-target":"AWSStepFunctions.StartExecution"
                 },
                 "body": {
-                "stateMachineArn": "${ProcessBooking}",
-                "input": "$util.escapeJavaScript($util.toJson($payload))"
+                    "stateMachineArn": "${ProcessBooking}",
+                    "input": "$util.escapeJavaScript($util.toJson($payload))",
+                    "name": $util.toJson($ctx.stash.executionId)
                 }
             }
         }
